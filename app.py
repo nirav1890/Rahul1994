@@ -4,7 +4,8 @@ import numpy as np
 import yfinance as yf
 import pandas_ta as ta
 import requests
-from datetime import datetime, timedelta
+import time
+from datetime import timedelta
 
 st.set_page_config(page_title="TA Confluence – India (NSE Intraday + Position)", layout="wide")
 
@@ -37,9 +38,8 @@ def fetch_yf_daily(symbol: str, period: str = "5y") -> pd.DataFrame:
     return df
 
 # =========================
-# NSE India intraday (unofficial)
+# Intraday – primary: NSE (unofficial), fallback: Yahoo Finance
 # =========================
-# NSE sometimes enforces cookies and headers; we warm up a session first.
 def _nse_session():
     s = requests.Session()
     ua = {
@@ -53,15 +53,16 @@ def _nse_session():
         "cache-control": "no-cache",
         "pragma": "no-cache",
     }
-    # Warm-up for cookies
+    # Warm up for cookies; short delay helps avoid 401
     s.get("https://www.nseindia.com", headers=ua, timeout=15)
+    time.sleep(1.0)
     return s, ua
 
 def fetch_nse_intraday(symbol: str, interval: str = "5min") -> pd.DataFrame:
     """
     Fetch intraday data from NSE 'chart-databyindex' endpoint and aggregate to OHLCV.
-    - interval: '1min' | '5min' | '15min'
-    - symbol: accepts RELIANCE, RELIANCE.NS, RELIANCE.BO (always fetched from NSE equity)
+    interval: '1min' | '5min' | '15min'
+    symbol: accepts RELIANCE, RELIANCE.NS, RELIANCE.BO (always fetched from NSE equity)
     """
     base = nse_base(symbol)
     index_code = f"{base}EQN"  # equity cash segment code for NSE chart endpoint
@@ -76,6 +77,7 @@ def fetch_nse_intraday(symbol: str, interval: str = "5min") -> pd.DataFrame:
 
     r = s.get(url, headers=headers, timeout=20)
     if r.status_code != 200:
+        # propagate status for the caller to decide fallback
         raise RuntimeError(f"NSE HTTP {r.status_code}")
 
     data = r.json() or {}
@@ -134,6 +136,53 @@ def fetch_nse_intraday(symbol: str, interval: str = "5min") -> pd.DataFrame:
         df = pd.concat([o,h,l,c,v], axis=1).dropna(how="any")
 
     return df
+
+def fetch_yf_intraday(symbol: str, interval: str = "5min", period_days: int = 7) -> pd.DataFrame:
+    """
+    Yahoo intraday fallback. interval: '1min'|'5min'|'15min' mapped to '1m'|'5m'|'15m'.
+    period_days controls how many days to fetch (Yahoo requires 'period' not start for intraday).
+    """
+    tf_map = {"1min": "1m", "5min": "5m", "15min": "15m"}
+    tf = tf_map.get(interval.lower(), "5m")
+    # Yahoo needs a valid suffix; keep whatever user selected (NSE/BSE)
+    df = yf.download(symbol, period=f"{int(period_days)}d", interval=tf, auto_adjust=True, progress=False)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).dropna()
+    # Ensure Datetime index
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    return df
+
+def fetch_intraday_with_fallback(symbol: str, interval: str = "5min", lookback_days: int = 5) -> (pd.DataFrame, str):
+    """
+    Try NSE first. On 401/403/empty -> fallback to Yahoo intraday with same symbol/suffix.
+    Returns (df, source_str)
+    """
+    # Always attempt NSE with NSE suffix (intraday is NSE-only)
+    nse_symbol = normalize_symbol(symbol, ".NS") if (symbol.endswith(".BO") or not symbol.endswith(".NS")) else symbol
+    try:
+        df_nse = fetch_nse_intraday(nse_symbol, interval=interval)
+        if not df_nse.empty:
+            return df_nse, "NSE"
+    except Exception as e:
+        # Only fallback for common block statuses or empty
+        if "NSE HTTP 401" in str(e) or "NSE HTTP 403" in str(e) or "no candles" in str(e).lower():
+            pass
+        else:
+            # For other unexpected errors, still try fallback
+            pass
+
+    # Fallback: Yahoo intraday with user's chosen suffix
+    df_yf = fetch_yf_intraday(symbol, interval=interval, period_days=max(lookback_days, 7))
+    if not df_yf.empty:
+        return df_yf, "Yahoo"
+    # If still empty, last resort: try NSE symbol on Yahoo (ensure .NS)
+    df_yf2 = fetch_yf_intraday(nse_symbol, interval=interval, period_days=max(lookback_days, 7))
+    if not df_yf2.empty:
+        return df_yf2, "Yahoo(.NS)"
+
+    raise RuntimeError("No intraday data from NSE or Yahoo for this symbol/interval.")
 
 # =========================
 # Indicators & scoring
@@ -328,7 +377,7 @@ def backtest(df: pd.DataFrame, mode: str, threshold: int):
 # UI
 # =========================
 st.title("Technical Analysis Confluence – Indian Stocks")
-st.caption("Intraday uses NSE (unofficial). Position uses Yahoo Finance daily data. No system is 100% accurate; this reports confluence + quick backtest.")
+st.caption("Intraday tries NSE first and falls back to Yahoo if blocked. Position uses Yahoo daily data. No system is 100% accurate; this reports confluence + quick backtest.")
 
 mode = st.radio("Mode", ["intraday", "position"], horizontal=True, index=0)
 
@@ -344,22 +393,21 @@ suffix = ".NS" if exchange.startswith("NSE") else ".BO"
 symbol = normalize_symbol(user_symbol, suffix)
 
 if mode == "intraday":
-    st.subheader("Intraday data source: NSE India (unofficial)")
-    # NSE intraday is NSE-only; if user picked BSE, warn and switch
+    st.subheader("Intraday data source: NSE → Yahoo fallback")
     if suffix == ".BO":
-        st.info("Intraday fetch uses NSE only. Switching to NSE for intraday.")
-        symbol = normalize_symbol(user_symbol, ".NS")
+        st.info("Intraday fetch prefers NSE. We’ll query NSE first, then Yahoo with your BSE symbol if needed.")
 
     ival = st.selectbox("Interval", ["1min","5min","15min"], index=1)
     lookback_days = st.number_input("Lookback days (display only)", min_value=1, max_value=30, value=5, step=1)
 
     if st.button("Analyze intraday", type="primary"):
         try:
-            df_raw = fetch_nse_intraday(symbol, interval=ival)
+            df_raw, src = fetch_intraday_with_fallback(symbol, interval=ival, lookback_days=int(lookback_days))
         except Exception as e:
-            st.error(f"Failed to fetch intraday data from NSE: {e}")
+            st.error(f"Failed to fetch intraday data: {e}")
             st.stop()
 
+        # Trim display window
         if not df_raw.empty:
             cutoff = df_raw.index.max() - pd.Timedelta(days=int(lookback_days))
             df_raw = df_raw[df_raw.index >= cutoff]
@@ -373,7 +421,7 @@ if mode == "intraday":
 
         col1, col2 = st.columns([2,1])
         with col1:
-            st.markdown(f"### {symbol} – Intraday price with Bollinger Bands")
+            st.markdown(f"### {symbol} – Intraday price (source: {src}) with Bollinger Bands")
             st.line_chart(df[["Close","BB_up","BB_mid","BB_low"]].dropna())
             st.markdown("### Confluence score (S_total)")
             st.line_chart(df[["S_total"]].dropna())
@@ -423,7 +471,7 @@ else:
             st.markdown("### Latest read")
             st.metric("S_total", f"{idea['score']}")
             st.metric("Close", f"{df['Close'].iloc[-1]:.2f}")
-            st.metric("ATR(14)", f"{df['ATR14'].iloc[-1]:.2f}")
+            st.metric("ATR(14)", f"{df['ATR14"].iloc[-1]:.2f}")
             if idea["valid"]:
                 st.success("**Long idea**")
                 st.write(f"- **Entry** ≈ {idea['entry']:.2f}")
