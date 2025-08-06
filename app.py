@@ -5,7 +5,6 @@ import yfinance as yf
 import pandas_ta as ta
 import requests
 import time
-from datetime import timedelta
 
 st.set_page_config(page_title="TA Confluence – India (NSE Intraday + Position)", layout="wide")
 
@@ -140,25 +139,42 @@ def fetch_nse_intraday(symbol: str, interval: str = "5min") -> pd.DataFrame:
 def fetch_yf_intraday(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 7) -> pd.DataFrame:
     """
     Yahoo intraday fallback. interval: '1min'|'5min'|'15min' mapped to '1m'|'5m'|'15m'.
-    Uses a valid period based on interval so Yahoo returns data.
+    Uses a valid period based on interval so Yahoo returns data, with retries on smaller windows.
     """
     tf_map = {"1min": "1m", "5min": "5m", "15min": "15m"}
     tf = tf_map.get(interval.lower(), "5m")
 
-    # Yahoo limits history by interval. Choose a valid period window.
-    if tf == "1m":
-        min_days, max_days = 7, 7
-    else:  # 5m / 15m
-        min_days, max_days = 7, 60
-    period_days = min(max_days, max(lookback_days, min_days))
+    # Yahoo's max allowed periods by interval
+    max_days = 7 if tf == "1m" else 60
+    # Clamp to valid range
+    period_days = min(max(lookback_days, 1), max_days)
 
-    df = yf.download(symbol_with_suffix, period=f"{int(period_days)}d", interval=tf, auto_adjust=True, progress=False)
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame()
-    df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).dropna()
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    return df
+    # Try progressively smaller windows to avoid empty/blocked responses
+    candidates = [period_days]
+    if tf in ("5m", "15m"):
+        if 30 not in candidates: candidates.append(30)
+        if 14 not in candidates: candidates.append(14)
+    if 7 not in candidates: candidates.append(7)
+    if 5 not in candidates: candidates.append(5)
+    if 2 not in candidates: candidates.append(2)
+
+    last_err = None
+    for d in candidates:
+        try:
+            df = yf.download(symbol_with_suffix, period=f"{int(d)}d", interval=tf, auto_adjust=True, progress=False)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).dropna()
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.to_datetime(df.index)
+                return df
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)  # brief backoff
+
+    # If nothing worked:
+    if last_err:
+        raise last_err
+    return pd.DataFrame()
 
 def fetch_intraday_with_fallback(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 5) -> (pd.DataFrame, str):
     """
@@ -179,9 +195,13 @@ def fetch_intraday_with_fallback(symbol_with_suffix: str, interval: str = "5min"
             pass  # still try Yahoo
 
     # Yahoo fallback with the EXACT suffix user selected
-    df_yf = fetch_yf_intraday(symbol_with_suffix, interval=interval, lookback_days=max(lookback_days, 7))
-    if not df_yf.empty:
-        return df_yf, "Yahoo"
+    try:
+        df_yf = fetch_yf_intraday(symbol_with_suffix, interval=interval, lookback_days=max(lookback_days, 7))
+        if not df_yf.empty:
+            return df_yf, "Yahoo"
+    except Exception:
+        # try last resort below
+        pass
 
     # Last resort: try NSE-suffixed symbol on Yahoo (e.g., RELIANCE.NS)
     df_yf2 = fetch_yf_intraday(nse_try, interval=interval, lookback_days=max(lookback_days, 7))
@@ -383,7 +403,7 @@ def backtest(df: pd.DataFrame, mode: str, threshold: int):
 # UI
 # =========================
 st.title("Technical Analysis Confluence – Indian Stocks")
-st.caption("Intraday tries NSE first and falls back to Yahoo if blocked. Position uses Yahoo daily data. No system is 100% accurate; this reports confluence + quick backtest.")
+st.caption("Intraday tries NSE first and falls back to Yahoo if blocked (with retries). Position uses Yahoo daily data.")
 
 mode = st.radio("Mode", ["intraday", "position"], horizontal=True, index=0)
 
@@ -399,7 +419,7 @@ suffix = ".NS" if exchange.startswith("NSE") else ".BO"
 symbol = normalize_symbol(user_symbol, suffix)
 
 if mode == "intraday":
-    st.subheader("Intraday data source: NSE → Yahoo fallback")
+    st.subheader("Intraday data source: NSE → Yahoo fallback (with retries)")
     if suffix == ".BO":
         st.info("Intraday fetch prefers NSE. We’ll query NSE first, then Yahoo with your BSE symbol if needed.")
 
