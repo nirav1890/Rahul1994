@@ -1,7 +1,9 @@
-python_version == "3.10"
-streamlit>=1.32
-yfinance>=0.2.40
-pandas>=2.0.0
-numpy>=1.24
-pandas-ta>=0.3.14b0
-requests>=2.31.0
+pip==24.2
+setuptools<70
+wheel
+streamlit==1.36.0
+yfinance==0.2.43
+pandas==2.2.2
+numpy==1.26.4
+pandas-ta==0.3.14b0
+requests==2.32.3
