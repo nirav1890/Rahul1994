@@ -30,7 +30,7 @@ def fetch_yf_daily(symbol: str, period: str = "5y") -> pd.DataFrame:
     return df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).dropna()
 
 # =========================
-# Intraday – primary: NSE (unofficial), fallback: Yahoo, then Twelve Data
+# Intraday – order: NSE (primary) → Twelve Data (preferred fallback) → Yahoo (last resort)
 # =========================
 def _nse_session():
     s = requests.Session()
@@ -43,7 +43,7 @@ def _nse_session():
         "cache-control": "no-cache",
         "pragma": "no-cache",
     }
-    s.get("https://www.nseindia.com", headers=ua, timeout=15)
+    s.get("https://www.nseindia.com", headers=ua, timeout=15)  # warm-up for cookies
     time.sleep(1.0)
     return s, ua
 
@@ -99,13 +99,53 @@ def fetch_nse_intraday(symbol: str, interval: str = "5min") -> pd.DataFrame:
         df = pd.concat([o,h,l,c,v], axis=1).dropna(how="any")
     return df
 
+def fetch_twelvedata_intraday(symbol_with_suffix: str, interval: str = "5min") -> pd.DataFrame:
+    """
+    Twelve Data (free) fallback.
+    Transform: RELIANCE.NS -> RELIANCE:NS, RELIANCE.BO -> RELIANCE:BSE
+    """
+    api_key = st.secrets.get("TWELVEDATA_API_KEY")
+    if not api_key:
+        return pd.DataFrame()
+
+    base = nse_base(symbol_with_suffix)
+    td_symbol = f"{base}:BSE" if symbol_with_suffix.endswith(".BO") else f"{base}:NS"
+    td_interval = {"1min":"1min","5min":"5min","15min":"15min"}.get(interval.lower(), "5min")
+
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": td_symbol,
+        "interval": td_interval,
+        "outputsize": 5000,
+        "format": "JSON",
+        "apikey": api_key,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        js = r.json()
+        vals = js.get("values")
+        if not vals:
+            return pd.DataFrame()
+        df = pd.DataFrame(vals)
+        df["Datetime"] = pd.to_datetime(df["datetime"])
+        df = df.sort_values("Datetime").set_index("Datetime")
+        df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+        df[["Open","High","Low","Close","Volume"]] = df[["Open","High","Low","Close","Volume"]].astype(float)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
 def fetch_yf_intraday(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 7) -> pd.DataFrame:
+    """
+    Yahoo (last resort). Uses Ticker.history with small, valid windows and retries.
+    """
     tf_map = {"1min": "1m", "5min": "5m", "15min": "15m"}
     tf = tf_map.get(interval.lower(), "5m")
     max_days = 7 if tf == "1m" else 60
     period_days = min(max(lookback_days, 1), max_days)
 
-    # Use Ticker().history as alternative path, with retries on smaller windows
     t = yf.Ticker(symbol_with_suffix)
     candidates = [period_days, 14, 7, 5, 2]
     seen = set()
@@ -124,52 +164,6 @@ def fetch_yf_intraday(symbol_with_suffix: str, interval: str = "5min", lookback_
             continue
     return pd.DataFrame()
 
-def fetch_twelvedata_intraday(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 7) -> pd.DataFrame:
-    """
-    Twelve Data fallback (free key via Streamlit Secrets).
-    Symbol format: 'RELIANCE.NS'  -> we convert to 'RELIANCE:NS'
-                   'RELIANCE.BO'  -> 'RELIANCE:BSE'
-    """
-    api_key = st.secrets.get("TWELVEDATA_API_KEY")
-    if not api_key:
-        return pd.DataFrame()
-
-    base = nse_base(symbol_with_suffix)
-    if symbol_with_suffix.endswith(".BO"):
-        td_symbol = f"{base}:BSE"
-    else:
-        td_symbol = f"{base}:NS"
-
-    td_interval = {"1min":"1min","5min":"5min","15min":"15min"}.get(interval.lower(), "5min")
-
-    # Twelve Data supports outputsize; requesting a reasonable window
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": td_symbol,
-        "interval": td_interval,
-        "outputsize": 5000,
-        "format": "JSON",
-        "apikey": api_key,
-    }
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return pd.DataFrame()
-        js = r.json()
-        vals = js.get("values")
-        if not vals:  # could be {'status':'error', 'message':...}
-            return pd.DataFrame()
-        # Convert to DataFrame
-        df = pd.DataFrame(vals)
-        # Expected keys: datetime, open, high, low, close, volume
-        df["Datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("Datetime").set_index("Datetime")
-        df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
-        df[["Open","High","Low","Close","Volume"]] = df[["Open","High","Low","Close","Volume"]].astype(float)
-        return df
-    except Exception:
-        return pd.DataFrame()
-
 def fetch_intraday_with_fallback(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 5) -> (pd.DataFrame, str):
     # 1) NSE (force .NS for this query)
     nse_try = normalize_symbol(nse_base(symbol_with_suffix), ".NS")
@@ -177,26 +171,25 @@ def fetch_intraday_with_fallback(symbol_with_suffix: str, interval: str = "5min"
         df_nse = fetch_nse_intraday(nse_try, interval=interval)
         if not df_nse.empty:
             return df_nse, "NSE"
-    except Exception as e:
-        # ignore and fall through
-        pass
+    except Exception:
+        pass  # fall through
 
-    # 2) Yahoo (with user’s chosen suffix), using robust Ticker.history path
+    # 2) Twelve Data (preferred fallback)
+    df_td = fetch_twelvedata_intraday(symbol_with_suffix, interval=interval)
+    if not df_td.empty:
+        return df_td, "TwelveData"
+
+    # 3) Yahoo (last resort; use user's suffix)
     df_yf = fetch_yf_intraday(symbol_with_suffix, interval=interval, lookback_days=max(lookback_days, 7))
     if not df_yf.empty:
         return df_yf, "Yahoo"
 
-    # 3) Twelve Data (needs key in secrets)
-    df_td = fetch_twelvedata_intraday(symbol_with_suffix, interval=interval, lookback_days=max(lookback_days, 7))
-    if not df_td.empty:
-        return df_td, "TwelveData"
-
-    # 4) Last resort: Yahoo with .NS even if user picked .BO
+    # Last try: Yahoo with .NS even if user chose BSE
     df_yf2 = fetch_yf_intraday(nse_try, interval=interval, lookback_days=max(lookback_days, 7))
     if not df_yf2.empty:
         return df_yf2, "Yahoo(.NS)"
 
-    raise RuntimeError("No intraday data from NSE, Yahoo, or Twelve Data for this symbol/interval.")
+    raise RuntimeError("No intraday data from NSE, Twelve Data, or Yahoo for this symbol/interval.")
 
 # =========================
 # Indicators & scoring
@@ -208,22 +201,26 @@ def add_common_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["EMA50"] = ta.ema(out["Close"], 50)
     out["SMA50"] = ta.sma(out["Close"], 50)
     out["SMA200"] = ta.sma(out["Close"], 200)
+
     macd = ta.macd(out["Close"])
     if macd is not None and not macd.empty:
         out["MACD"] = macd.iloc[:,0]; out["MACDsig"] = macd.iloc[:,1]; out["MACDhist"] = macd.iloc[:,2]
     else:
         out["MACD"] = out["MACDsig"] = out["MACDhist"] = np.nan
+
     out["RSI14"] = ta.rsi(out["Close"], 14)
     stoch = ta.stoch(out["High"], out["Low"], out["Close"], k=14, d=3, smooth_k=3)
     if stoch is not None and not stoch.empty:
         out["STOCHk"] = stoch.iloc[:,0]; out["STOCHd"] = stoch.iloc[:,1]
     else:
         out["STOCHk"] = out["STOCHd"] = np.nan
+
     bb = ta.bbands(out["Close"], 20, 2)
     if bb is not None and not bb.empty:
         out["BB_up"], out["BB_mid"], out["BB_low"] = bb.iloc[:,0], bb.iloc[:,1], bb.iloc[:,2]
     else:
         out["BB_up"] = out["BB_mid"] = out["BB_low"] = np.nan
+
     out["ATR14"] = ta.atr(out["High"], out["Low"], out["Close"], 14)
     out["OBV"] = ta.obv(out["Close"], out["Volume"])
     try:
@@ -364,7 +361,7 @@ def backtest(df: pd.DataFrame, mode: str, threshold: int):
 # UI
 # =========================
 st.title("Technical Analysis Confluence – Indian Stocks")
-st.caption("Intraday tries NSE → Yahoo → Twelve Data (free). Position uses Yahoo daily data.")
+st.caption("Intraday tries NSE → Twelve Data → Yahoo (auto-fallback). Position uses Yahoo daily data.")
 
 mode = st.radio("Mode", ["intraday", "position"], horizontal=True, index=0)
 colA, colB, colC = st.columns([1.4,1,1])
@@ -379,7 +376,7 @@ suffix = ".NS" if exchange.startswith("NSE") else ".BO"
 symbol = normalize_symbol(user_symbol, suffix)
 
 if mode == "intraday":
-    st.subheader("Intraday: NSE → Yahoo → Twelve Data (auto-fallback)")
+    st.subheader("Intraday: NSE → Twelve Data → Yahoo (auto-fallback)")
     ival = st.selectbox("Interval", ["1min","5min","15min"], index=1)
     lookback_days = st.number_input("Lookback days (display only)", 1, 60, 5, step=1)
 
@@ -459,5 +456,3 @@ else:
                 st.write(f"- **Stop-loss** ≈ {idea['stop']:.2f} (≈ 2×ATR)")
                 st.write(f"- **Target** ≈ {idea['target']:.2f} (≈ 2R)")
                 st.write(f"- **Time window:** {idea['horizon']}")
-            else:
-                st.info("No fresh long signal at the chosen threshold. Consider waiting or lowering the threshold.")
