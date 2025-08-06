@@ -137,48 +137,54 @@ def fetch_nse_intraday(symbol: str, interval: str = "5min") -> pd.DataFrame:
 
     return df
 
-def fetch_yf_intraday(symbol: str, interval: str = "5min", period_days: int = 7) -> pd.DataFrame:
+def fetch_yf_intraday(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 7) -> pd.DataFrame:
     """
     Yahoo intraday fallback. interval: '1min'|'5min'|'15min' mapped to '1m'|'5m'|'15m'.
-    period_days controls how many days to fetch (Yahoo requires 'period' not start for intraday).
+    Uses a valid period based on interval so Yahoo returns data.
     """
     tf_map = {"1min": "1m", "5min": "5m", "15min": "15m"}
     tf = tf_map.get(interval.lower(), "5m")
-    # Yahoo needs a valid suffix; keep whatever user selected (NSE/BSE)
-    df = yf.download(symbol, period=f"{int(period_days)}d", interval=tf, auto_adjust=True, progress=False)
+
+    # Yahoo limits history by interval. Choose a valid period window.
+    if tf == "1m":
+        min_days, max_days = 7, 7
+    else:  # 5m / 15m
+        min_days, max_days = 7, 60
+    period_days = min(max_days, max(lookback_days, min_days))
+
+    df = yf.download(symbol_with_suffix, period=f"{int(period_days)}d", interval=tf, auto_adjust=True, progress=False)
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
     df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).dropna()
-    # Ensure Datetime index
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index)
     return df
 
-def fetch_intraday_with_fallback(symbol: str, interval: str = "5min", lookback_days: int = 5) -> (pd.DataFrame, str):
+def fetch_intraday_with_fallback(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 5) -> (pd.DataFrame, str):
     """
-    Try NSE first. On 401/403/empty -> fallback to Yahoo intraday with same symbol/suffix.
-    Returns (df, source_str)
+    Try NSE first (forces .NS for NSE query). On 401/403/empty -> fallback to Yahoo intraday
+    with the user's chosen suffix (.NS or .BO). Returns (df, source_str).
     """
-    # Always attempt NSE with NSE suffix (intraday is NSE-only)
-    nse_symbol = normalize_symbol(symbol, ".NS") if (symbol.endswith(".BO") or not symbol.endswith(".NS")) else symbol
+    # Force NSE suffix for primary fetch
+    nse_try = normalize_symbol(nse_base(symbol_with_suffix), ".NS")
     try:
-        df_nse = fetch_nse_intraday(nse_symbol, interval=interval)
+        df_nse = fetch_nse_intraday(nse_try, interval=interval)
         if not df_nse.empty:
             return df_nse, "NSE"
     except Exception as e:
-        # Only fallback for common block statuses or empty
+        # Fallback for common block statuses or empty; ignore and proceed to Yahoo
         if "NSE HTTP 401" in str(e) or "NSE HTTP 403" in str(e) or "no candles" in str(e).lower():
             pass
         else:
-            # For other unexpected errors, still try fallback
-            pass
+            pass  # still try Yahoo
 
-    # Fallback: Yahoo intraday with user's chosen suffix
-    df_yf = fetch_yf_intraday(symbol, interval=interval, period_days=max(lookback_days, 7))
+    # Yahoo fallback with the EXACT suffix user selected
+    df_yf = fetch_yf_intraday(symbol_with_suffix, interval=interval, lookback_days=max(lookback_days, 7))
     if not df_yf.empty:
         return df_yf, "Yahoo"
-    # If still empty, last resort: try NSE symbol on Yahoo (ensure .NS)
-    df_yf2 = fetch_yf_intraday(nse_symbol, interval=interval, period_days=max(lookback_days, 7))
+
+    # Last resort: try NSE-suffixed symbol on Yahoo (e.g., RELIANCE.NS)
+    df_yf2 = fetch_yf_intraday(nse_try, interval=interval, lookback_days=max(lookback_days, 7))
     if not df_yf2.empty:
         return df_yf2, "Yahoo(.NS)"
 
@@ -398,7 +404,7 @@ if mode == "intraday":
         st.info("Intraday fetch prefers NSE. We’ll query NSE first, then Yahoo with your BSE symbol if needed.")
 
     ival = st.selectbox("Interval", ["1min","5min","15min"], index=1)
-    lookback_days = st.number_input("Lookback days (display only)", min_value=1, max_value=30, value=5, step=1)
+    lookback_days = st.number_input("Lookback days (display only)", min_value=1, max_value=60, value=5, step=1)
 
     if st.button("Analyze intraday", type="primary"):
         try:
