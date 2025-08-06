@@ -30,7 +30,7 @@ def fetch_yf_daily(symbol: str, period: str = "5y") -> pd.DataFrame:
     return df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).dropna()
 
 # =========================
-# Intraday – order: NSE (primary) → Twelve Data (preferred fallback) → Yahoo (last resort)
+# Intraday – order: NSE (primary) → Twelve Data (fallback)
 # =========================
 def _nse_session():
     s = requests.Session()
@@ -43,7 +43,7 @@ def _nse_session():
         "cache-control": "no-cache",
         "pragma": "no-cache",
     }
-    s.get("https://www.nseindia.com", headers=ua, timeout=15)  # warm-up for cookies
+    s.get("https://www.nseindia.com", headers=ua, timeout=15)  # warm-up cookies
     time.sleep(1.0)
     return s, ua
 
@@ -106,7 +106,7 @@ def fetch_twelvedata_intraday(symbol_with_suffix: str, interval: str = "5min") -
     """
     api_key = st.secrets.get("TWELVEDATA_API_KEY")
     if not api_key:
-        return pd.DataFrame()
+        raise RuntimeError("Missing TWELVEDATA_API_KEY in Streamlit secrets")
 
     base = nse_base(symbol_with_suffix)
     td_symbol = f"{base}:BSE" if symbol_with_suffix.endswith(".BO") else f"{base}:NS"
@@ -120,76 +120,41 @@ def fetch_twelvedata_intraday(symbol_with_suffix: str, interval: str = "5min") -
         "format": "JSON",
         "apikey": api_key,
     }
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            return pd.DataFrame()
-        js = r.json()
-        vals = js.get("values")
-        if not vals:
-            return pd.DataFrame()
-        df = pd.DataFrame(vals)
-        df["Datetime"] = pd.to_datetime(df["datetime"])
-        df = df.sort_values("Datetime").set_index("Datetime")
-        df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
-        df[["Open","High","Low","Close","Volume"]] = df[["Open","High","Low","Close","Volume"]].astype(float)
-        return df
-    except Exception:
-        return pd.DataFrame()
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"TwelveData HTTP {r.status_code}")
+    js = r.json()
+    vals = js.get("values")
+    if not vals:
+        # Surface API error messages to UI if present
+        msg = js.get("message") or "No values from Twelve Data"
+        raise RuntimeError(f"TwelveData error: {msg}")
 
-def fetch_yf_intraday(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 7) -> pd.DataFrame:
-    """
-    Yahoo (last resort). Uses Ticker.history with small, valid windows and retries.
-    """
-    tf_map = {"1min": "1m", "5min": "5m", "15min": "15m"}
-    tf = tf_map.get(interval.lower(), "5m")
-    max_days = 7 if tf == "1m" else 60
-    period_days = min(max(lookback_days, 1), max_days)
+    df = pd.DataFrame(vals)
+    df["Datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("Datetime").set_index("Datetime")
+    df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+    df[["Open","High","Low","Close","Volume"]] = df[["Open","High","Low","Close","Volume"]].astype(float)
+    return df
 
-    t = yf.Ticker(symbol_with_suffix)
-    candidates = [period_days, 14, 7, 5, 2]
-    seen = set()
-    for d in candidates:
-        if d in seen: continue
-        seen.add(d)
-        try:
-            df = t.history(period=f"{int(d)}d", interval=tf, auto_adjust=True)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}).dropna()
-                if not isinstance(df.index, pd.DatetimeIndex):
-                    df.index = pd.to_datetime(df.index)
-                return df
-        except Exception:
-            time.sleep(0.4)
-            continue
-    return pd.DataFrame()
-
-def fetch_intraday_with_fallback(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 5) -> (pd.DataFrame, str):
+def fetch_intraday(symbol_with_suffix: str, interval: str = "5min", lookback_days: int = 5) -> (pd.DataFrame, str):
     # 1) NSE (force .NS for this query)
     nse_try = normalize_symbol(nse_base(symbol_with_suffix), ".NS")
     try:
         df_nse = fetch_nse_intraday(nse_try, interval=interval)
         if not df_nse.empty:
             return df_nse, "NSE"
-    except Exception:
-        pass  # fall through
+    except Exception as e:
+        # Show why NSE failed (401/403/etc.)
+        st.info(f"NSE fetch failed: {e}")
 
-    # 2) Twelve Data (preferred fallback)
+    # 2) Twelve Data (requires key)
     df_td = fetch_twelvedata_intraday(symbol_with_suffix, interval=interval)
     if not df_td.empty:
         return df_td, "TwelveData"
 
-    # 3) Yahoo (last resort; use user's suffix)
-    df_yf = fetch_yf_intraday(symbol_with_suffix, interval=interval, lookback_days=max(lookback_days, 7))
-    if not df_yf.empty:
-        return df_yf, "Yahoo"
-
-    # Last try: Yahoo with .NS even if user chose BSE
-    df_yf2 = fetch_yf_intraday(nse_try, interval=interval, lookback_days=max(lookback_days, 7))
-    if not df_yf2.empty:
-        return df_yf2, "Yahoo(.NS)"
-
-    raise RuntimeError("No intraday data from NSE, Twelve Data, or Yahoo for this symbol/interval.")
+    # If we got here, both failed
+    raise RuntimeError("No intraday data from NSE or Twelve Data.")
 
 # =========================
 # Indicators & scoring
@@ -201,26 +166,22 @@ def add_common_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["EMA50"] = ta.ema(out["Close"], 50)
     out["SMA50"] = ta.sma(out["Close"], 50)
     out["SMA200"] = ta.sma(out["Close"], 200)
-
     macd = ta.macd(out["Close"])
     if macd is not None and not macd.empty:
         out["MACD"] = macd.iloc[:,0]; out["MACDsig"] = macd.iloc[:,1]; out["MACDhist"] = macd.iloc[:,2]
     else:
         out["MACD"] = out["MACDsig"] = out["MACDhist"] = np.nan
-
     out["RSI14"] = ta.rsi(out["Close"], 14)
     stoch = ta.stoch(out["High"], out["Low"], out["Close"], k=14, d=3, smooth_k=3)
     if stoch is not None and not stoch.empty:
         out["STOCHk"] = stoch.iloc[:,0]; out["STOCHd"] = stoch.iloc[:,1]
     else:
         out["STOCHk"] = out["STOCHd"] = np.nan
-
     bb = ta.bbands(out["Close"], 20, 2)
     if bb is not None and not bb.empty:
         out["BB_up"], out["BB_mid"], out["BB_low"] = bb.iloc[:,0], bb.iloc[:,1], bb.iloc[:,2]
     else:
         out["BB_up"] = out["BB_mid"] = out["BB_low"] = np.nan
-
     out["ATR14"] = ta.atr(out["High"], out["Low"], out["Close"], 14)
     out["OBV"] = ta.obv(out["Close"], out["Volume"])
     try:
@@ -361,7 +322,7 @@ def backtest(df: pd.DataFrame, mode: str, threshold: int):
 # UI
 # =========================
 st.title("Technical Analysis Confluence – Indian Stocks")
-st.caption("Intraday tries NSE → Twelve Data → Yahoo (auto-fallback). Position uses Yahoo daily data.")
+st.caption("Intraday uses NSE → Twelve Data (fallback). Position uses Yahoo daily data.")
 
 mode = st.radio("Mode", ["intraday", "position"], horizontal=True, index=0)
 colA, colB, colC = st.columns([1.4,1,1])
@@ -376,56 +337,65 @@ suffix = ".NS" if exchange.startswith("NSE") else ".BO"
 symbol = normalize_symbol(user_symbol, suffix)
 
 if mode == "intraday":
-    st.subheader("Intraday: NSE → Twelve Data → Yahoo (auto-fallback)")
+    st.subheader("Intraday: NSE → Twelve Data")
     ival = st.selectbox("Interval", ["1min","5min","15min"], index=1)
     lookback_days = st.number_input("Lookback days (display only)", 1, 60, 5, step=1)
 
     if st.button("Analyze intraday", type="primary"):
         try:
-            df_raw, src = fetch_intraday_with_fallback(symbol, interval=ival, lookback_days=int(lookback_days))
+            # NSE first
+            nse_symbol = normalize_symbol(nse_base(symbol), ".NS")
+            try:
+                df_raw = fetch_nse_intraday(nse_symbol, interval=ival)
+                src = "NSE"
+            except Exception as ne:
+                st.info(f"NSE fetch failed: {ne}. Trying Twelve Data…")
+                df_raw = fetch_twelvedata_intraday(symbol, interval=ival)
+                src = "TwelveData"
+
+            if not df_raw.empty:
+                cutoff = df_raw.index.max() - pd.Timedelta(days=int(lookback_days))
+                df_raw = df_raw[df_raw.index >= cutoff]
+
+            if df_raw.empty:
+                st.error("No intraday data returned by NSE or Twelve Data. Check your TWELVEDATA_API_KEY in Secrets.")
+                st.stop()
+
+            df = compute_scores(df_raw, mode="intraday")
+            idea = suggest_trade(df, mode="intraday", threshold=int(threshold))
+
+            col1, col2 = st.columns([2,1])
+            with col1:
+                st.markdown(f"### {symbol} – Intraday price (source: {src}) with Bollinger Bands")
+                st.line_chart(df[["Close","BB_up","BB_mid","BB_low"]].dropna())
+                st.markdown("### Confluence score (S_total)")
+                st.line_chart(df[["S_total"]].dropna())
+            with col2:
+                st.markdown("### Latest read")
+                st.metric("S_total", f"{idea['score']}")
+                st.metric("Close", f"{df['Close'].iloc[-1]:.2f}")
+                st.metric("ATR(14)", f"{df['ATR14'].iloc[-1]:.2f}")
+                if idea["valid"]:
+                    st.success("**Long idea**")
+                    st.write(f"- **Entry** ≈ {idea['entry']:.2f}")
+                    st.write(f"- **Stop-loss** ≈ {idea['stop']:.2f} (≈ 1.5×ATR)")
+                    st.write(f"- **Target** ≈ {idea['target']:.2f} (≈ 2R)")
+                    st.write(f"- **Time window:** {idea['horizon']}")
+                else:
+                    st.info("No fresh long signal at the chosen threshold. Consider waiting or lowering the threshold.")
+
+            st.markdown("### Quick backtest (recent period)")
+            bt = backtest(df, mode="intraday", threshold=int(threshold))
+            if bt["trades"] == 0:
+                st.write("No completed trades in sample window.")
+            else:
+                st.write(f"- Trades: **{bt['trades']}**")
+                st.write(f"- Win-rate: **{bt['win_rate']:.0%}**")
+                st.write(f"- Avg return / trade: **{bt['avg_return']:.2%}**")
+                st.write(f"- Best / Worst: **{bt['best']:.2%} / {bt['worst']:.2%}**")
         except Exception as e:
             st.error(f"Failed to fetch intraday data: {e}")
             st.stop()
-
-        if not df_raw.empty:
-            cutoff = df_raw.index.max() - pd.Timedelta(days=int(lookback_days))
-            df_raw = df_raw[df_raw.index >= cutoff]
-        if df_raw.empty:
-            st.warning("No intraday data returned for this symbol/interval.")
-            st.stop()
-
-        df = compute_scores(df_raw, mode="intraday")
-        idea = suggest_trade(df, mode="intraday", threshold=int(threshold))
-
-        col1, col2 = st.columns([2,1])
-        with col1:
-            st.markdown(f"### {symbol} – Intraday price (source: {src}) with Bollinger Bands")
-            st.line_chart(df[["Close","BB_up","BB_mid","BB_low"]].dropna())
-            st.markdown("### Confluence score (S_total)")
-            st.line_chart(df[["S_total"]].dropna())
-        with col2:
-            st.markdown("### Latest read")
-            st.metric("S_total", f"{idea['score']}")
-            st.metric("Close", f"{df['Close'].iloc[-1]:.2f}")
-            st.metric("ATR(14)", f"{df['ATR14'].iloc[-1]:.2f}")
-            if idea["valid"]:
-                st.success("**Long idea**")
-                st.write(f"- **Entry** ≈ {idea['entry']:.2f}")
-                st.write(f"- **Stop-loss** ≈ {idea['stop']:.2f} (≈ 1.5×ATR)")
-                st.write(f"- **Target** ≈ {idea['target']:.2f} (≈ 2R)")
-                st.write(f"- **Time window:** {idea['horizon']}")
-            else:
-                st.info("No fresh long signal at the chosen threshold. Consider waiting or lowering the threshold.")
-
-        st.markdown("### Quick backtest (recent period)")
-        bt = backtest(df, mode="intraday", threshold=int(threshold))
-        if bt["trades"] == 0:
-            st.write("No completed trades in sample window.")
-        else:
-            st.write(f"- Trades: **{bt['trades']}**")
-            st.write(f"- Win-rate: **{bt['win_rate']:.0%}**")
-            st.write(f"- Avg return / trade: **{bt['avg_return']:.2%}**")
-            st.write(f"- Best / Worst: **{bt['best']:.2%} / {bt['worst']:.2%}**")
 
 else:
     st.subheader("Position data source: Yahoo Finance (daily)")
