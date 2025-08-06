@@ -471,7 +471,7 @@ else:
             st.markdown("### Latest read")
             st.metric("S_total", f"{idea['score']}")
             st.metric("Close", f"{df['Close'].iloc[-1]:.2f}")
-            st.metric("ATR(14)", f"{df['ATR14"].iloc[-1]:.2f}")
+            st.metric("ATR(14)", f"{df['ATR14'].iloc[-1]:.2f}")
             if idea["valid"]:
                 st.success("**Long idea**")
                 st.write(f"- **Entry** ≈ {idea['entry']:.2f}")
